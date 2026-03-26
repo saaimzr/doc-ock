@@ -246,7 +246,7 @@ int main(void)
   print_msg("PCA9685 PWM frequency set to 50 Hz for servos\r\n");
 
   // To track current counts for each motor so we can do smooth transitions
-  int current_counts[4] = {SERVO_CENTER_COUNT, SERVO_CENTER_COUNT,
+  int current_counts[4] = {SERVO_CENTER_COUNT - 65, SERVO_CENTER_COUNT,
                            SERVO_CENTER_COUNT, SERVO_CENTER_COUNT};
 
   // Step 0: Ensure we start perfectly at center instantly so we have a known
