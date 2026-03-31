@@ -1,30 +1,10 @@
 /* USER CODE BEGIN Header */
 /**
-  ******************************************************************************
-  * @file           : main.c
-  * @brief          : IK pick-and-place demo using PCA9685
-  ******************************************************************************
-  * @attention
-  *
-  * First-pass assumptions:
-  * - Workspace frame is from robot perspective:
-  *     origin = paper corner closest to robot
-  *     +x = toward left edge of paper
-  *     +y = toward top edge of paper
-  * - Paper plane is z = 0
-  * - Neutral servo counts correspond to logical angle 0
-  * - Min side corresponds to negative angle
-  * - Max side corresponds to positive angle
-  * - Linear count <-> angle mapping
-  *
-  * Joint mapping:
-  * - Channel 0 = Base
-  * - Channel 1 = Shoulder
-  * - Channel 2 = Elbow
-  * - Channel 3 = Claw
-  *
-  ******************************************************************************
-  */
+ ******************************************************************************
+ * @file : main.c
+ * @brief : Merged manual joystick + UART CV auto pick/place controller
+ ******************************************************************************
+ */
 /* USER CODE END Header */
 
 /* Includes ------------------------------------------------------------------*/
@@ -35,19 +15,48 @@
 #include "pca9685.h"
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 /* USER CODE BEGIN PTD */
 typedef struct {
-  int current_count;
-  int min_count;
-  int center_count;
-  int max_count;
-  uint8_t reversed;
-  const char *name;
+ int current_count;
+ int min_count;
+ int center_count;
+ int max_count;
+ uint8_t reversed;
+ const char *name;
 } ServoConfig;
+
+typedef struct {
+ int shoulder_count;
+ int elbow_count;
+ float x_cm;
+ float y_cm;
+ float z_cm;
+} EmpiricalArmPose;
+
+typedef struct {
+ uint16_t x_raw;
+ uint16_t y_raw;
+ int x_norm;
+ int y_norm;
+ uint8_t button;
+} JoystickState;
+
+typedef struct {
+ float x_cm;
+ float y_cm;
+ float z_cm;
+ uint8_t valid;
+} CartesianTarget;
+
+typedef enum {
+ ROBOT_MODE_MANUAL = 0,
+ ROBOT_MODE_AUTO = 1
+} RobotMode;
 
 typedef struct {
   float base_deg;
@@ -60,160 +69,157 @@ typedef struct {
   int shoulder_count;
   int elbow_count;
 } JointCounts;
-
-typedef struct {
-  int shoulder_count;
-  int elbow_count;
-  float x_cm;
-  float y_cm;
-  float z_cm;
-} EmpiricalArmPose;
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-/* Servo channels on PCA9685 */
-#define CLAW_OPEN_HOLD_COUNT   410
-#define CLAW_CLOSE_COUNT       320
+#define BASE_SERVO_MOTOR 0
+#define ARM_SERVO_MOTOR1 1
+#define ARM_SERVO_MOTOR2 2
+#define CLAW_SERVO_MOTOR 3
 
+#define BASE_MIN_COUNT 200
+#define BASE_CENTER_COUNT 450
+#define BASE_MAX_COUNT 620
 
-#define BASE_SERVO_MOTOR   0
-#define ARM_SERVO_MOTOR1   1   /* Shoulder */
-#define ARM_SERVO_MOTOR2   2   /* Elbow */
-#define CLAW_SERVO_MOTOR   3
+#define ARM1_MIN_COUNT 220
+#define ARM1_CENTER_COUNT 410
+#define ARM1_MAX_COUNT 600
 
-/* Final ROM values */
-#define BASE_MIN_COUNT     200
-#define BASE_CENTER_COUNT  450
-#define BASE_MAX_COUNT     620
+#define ARM2_MIN_COUNT 220
+#define ARM2_CENTER_COUNT 410
+#define ARM2_MAX_COUNT 620
 
-#define ARM1_MIN_COUNT     220
-#define ARM1_CENTER_COUNT  410
-#define ARM1_MAX_COUNT     600
+#define CLAW_MIN_COUNT 290
+#define CLAW_CENTER_COUNT 410
+#define CLAW_MAX_COUNT 470
 
-#define ARM2_MIN_COUNT     220
-#define ARM2_CENTER_COUNT  410
-#define ARM2_MAX_COUNT     620
+#define CLAW_OPEN_HOLD_COUNT 410
+#define CLAW_CLOSE_COUNT 380
 
-#define CLAW_MIN_COUNT     290   /* close */
-#define CLAW_CENTER_COUNT  410
-#define CLAW_MAX_COUNT     470   /* open */
+#define HOME_BASE_COUNT BASE_CENTER_COUNT
+#define HOME_SHOULDER_COUNT ARM1_CENTER_COUNT
+#define HOME_ELBOW_COUNT ARM2_CENTER_COUNT
+#define HOME_CLAW_COUNT CLAW_OPEN_HOLD_COUNT
 
-/* Smooth motion timing */
-#define MOTION_DT_MS               20.0f
-#define DEFAULT_MAX_SPEED_CPS      120.0f
-#define DEFAULT_ACCEL_CPS2         240.0f
+#define MOTION_DT_MS 20.0f
+#define DEFAULT_MAX_SPEED_CPS 120.0f
+#define DEFAULT_ACCEL_CPS2 240.0f
 
-/* Pause times */
-#define SHORT_SETTLE_MS            600
-#define LONG_SETTLE_MS             1200
+#define HOME_RETURN_MAX_SPEED_CPS 45.0f
+#define HOME_RETURN_ACCEL_CPS2 90.0f
 
-/* Workspace / geometry */
-#define PAPER_WIDTH_CM             25.0f
-#define PAPER_HEIGHT_CM            20.0f
+#define AUTO_WAIT_BETWEEN_CYCLES_MS 5000U
+#define AUTO_LIFT_DELTA_Z_CM 1.5f
+#define AUTO_DROP_X_CM 20.0f
+#define AUTO_DROP_Y_CM 13.0f
+#define AUTO_DROP_Z_CM 0.5f
 
-/* Robot base axis in workspace coordinates */
-#define BASE_X_CM                  9.2f
-#define BASE_Y_CM                 -4.0f
-#define BASE_Z_CM                   3.0f
+/* safe z bounds for the scripted lift/drop (ik does the reach clamp) */
+#define AUTO_Z_MIN_CM 0.0f
+#define AUTO_Z_MAX_CM 10.0f
 
-/* Shoulder pivot height above paper */
-#define SHOULDER_Z_CM             13.0f
+#define BASE_COUNTS_PER_CM_X 9.5f
+#define CAL_Y_MIN_CM 10.7f
+#define CAL_Y_MAX_CM 16.7f
+#define CAL_Z_MIN_CM 3.0f
+#define CAL_Z_MAX_CM 6.5f
 
-/* Effective link lengths */
-#define LINK1_CM                   8.3f
-#define LINK2_CM                  13.0f
+/* analytic ik parameters (tune these for your arm) */
+#define IK_BASE_X_CM 9.2f
+#define IK_BASE_Y_CM -4.0f
+#define IK_SHOULDER_Z_CM 13.0f
 
-/* Hardcoded test points */
-#define PICK_X_CM                  3.0f
-#define PICK_Y_CM                  3.0f
-#define DROP_X_CM                 21.0f
-#define DROP_Y_CM                  3.0f
+#define IK_LINK1_CM 8.3f
+#define IK_LINK2_CM 13.0f
 
-/* Heights above paper */
-#define APPROACH_Z_CM              3.0f
-#define GRASP_Z_CM                 0.5f
+#define IK_REACH_MARGIN_CM 0.3f
+#define IK_CLAMP_UNREACHABLE_TARGETS 1
 
-/* First-pass logical angle spans */
-#define BASE_MIN_DEG             -90.0f
-#define BASE_MAX_DEG              90.0f
+/* logical angle ranges: center count corresponds to 0 deg */
+#define BASE_MIN_DEG -90.0f
+#define BASE_MAX_DEG 90.0f
+#define SHOULDER_MIN_DEG -70.0f
+#define SHOULDER_MAX_DEG 70.0f
+#define ELBOW_MIN_DEG -80.0f
+#define ELBOW_MAX_DEG 80.0f
 
-#define SHOULDER_MIN_DEG         -70.0f
-#define SHOULDER_MAX_DEG          70.0f
+/* neutral offsets: tuned so ik angles match your servo-count zeroes */
+#define IK_BASE_FORWARD_ABS_DEG 0.0f
+#define IK_SHOULDER_NEUTRAL_ABS_DEG 18.0f
+#define IK_ELBOW_NEUTRAL_REL_DEG 112.0f
 
-#define ELBOW_MIN_DEG            -80.0f
-#define ELBOW_MAX_DEG             80.0f
+#define J1_X_CHANNEL ADC_CHANNEL_0
+#define J1_Y_CHANNEL ADC_CHANNEL_1
+#define J2_X_CHANNEL ADC_CHANNEL_4
+#define J2_Y_CHANNEL ADC_CHANNEL_5
 
-/* Neutral absolute/reference assumptions */
-#define BASE_FORWARD_ABS_DEG       0.0f
-#define SHOULDER_NEUTRAL_ABS_DEG   18.0f
-#define ELBOW_NEUTRAL_REL_DEG     112.0f
-#define REACH_MARGIN_CM            0.3f
-#define CLAMP_UNREACHABLE_TARGETS  1
+#define JOY_CENTER 2048
+#define JOY_DEADZONE 180
+#define JOY_MAX 4095
 
+#define JOYSTICK_STEP_SIZE_COUNTS 70
 
+#define RX_BUFFER_SIZE 64
 
-/* Slower return-to-home motion */
-#define HOME_RETURN_MAX_SPEED_CPS   45.0f
-#define HOME_RETURN_ACCEL_CPS2      90.0f
-
-#define BASE_COUNTS_PER_CM_X       9.5f
-
-/* Expanded calibrated XY/Z region from measurements */
-#define CAL_Y_MIN_CM               10.7f
-#define CAL_Y_MAX_CM               16.7f
-#define CAL_Z_MIN_CM                3.0f
-#define CAL_Z_MAX_CM                6.5f
-
-#define MANUAL_BASE_COUNT      450
-#define MANUAL_SHOULDER_COUNT  280
-#define MANUAL_ELBOW_COUNT     575
-#define MANUAL_CLAW_COUNT      340 //higher means more open
-
-
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
 #endif
-/* USER CODE END PM */
+/* USER CODE END PD */
 
 /* Private variables ---------------------------------------------------------*/
 I2C_HandleTypeDef hi2c2;
 UART_HandleTypeDef huart3;
+ADC_HandleTypeDef hadc1;
 PCD_HandleTypeDef hpcd_USB_OTG_FS;
 
 /* USER CODE BEGIN PV */
-ServoConfig servos[4] = {
-    {BASE_CENTER_COUNT, BASE_MIN_COUNT, BASE_CENTER_COUNT, BASE_MAX_COUNT, 0, "Base Servo"},
-    {ARM1_CENTER_COUNT, ARM1_MIN_COUNT, ARM1_CENTER_COUNT, ARM1_MAX_COUNT, 0, "Shoulder Servo"},
-    {ARM2_CENTER_COUNT, ARM2_MIN_COUNT, ARM2_CENTER_COUNT, ARM2_MAX_COUNT, 0, "Elbow Servo"},
-    {CLAW_CENTER_COUNT, CLAW_MIN_COUNT, CLAW_CENTER_COUNT, CLAW_MAX_COUNT, 0, "Claw Servo"}
+static ServoConfig servos[4] = {
+ {BASE_CENTER_COUNT, BASE_MIN_COUNT, BASE_CENTER_COUNT, BASE_MAX_COUNT, 0, "Base Servo"},
+ {ARM1_CENTER_COUNT, ARM1_MIN_COUNT, ARM1_CENTER_COUNT, ARM1_MAX_COUNT, 0, "Shoulder Servo"},
+ {ARM2_CENTER_COUNT, ARM2_MIN_COUNT, ARM2_CENTER_COUNT, ARM2_MAX_COUNT, 0, "Elbow Servo"},
+ {CLAW_CENTER_COUNT, CLAW_MIN_COUNT, CLAW_CENTER_COUNT, CLAW_MAX_COUNT, 0, "Claw Servo"}
 };
 
 static const EmpiricalArmPose arm_pose_table[] = {
-    /* Near / lower-y band */
-    {220, 565, 12.5f, 12.9f, 4.2f},
-    {220, 570, 11.6f, 13.2f, 3.5f},
-
-    /* Middle-near band */
-    {280, 565, 11.4f, 14.2f, 5.5f},
-    {280, 575, 11.5f, 14.5f, 4.0f},
-    {280, 590, 11.4f, 14.2f, 3.5f},
-
-    /* Best flat mid band */
-    {330, 590, 11.9f, 15.5f, 4.5f},
-    {330, 610, 12.0f, 15.6f, 4.3f},
-
-    /* Far-center band */
-    {380, 600, 11.8f, 16.5f, 4.4f},
-    {380, 610, 11.8f, 16.0f, 3.0f}
+ {220, 565, 12.5f, 12.9f, 4.2f},
+ {220, 570, 11.6f, 13.2f, 3.5f},
+ {280, 565, 11.4f, 14.2f, 5.5f},
+ {280, 575, 11.5f, 14.5f, 4.0f},
+ {280, 590, 11.4f, 14.2f, 3.5f},
+ {330, 590, 11.9f, 15.5f, 4.5f},
+ {330, 610, 12.0f, 15.6f, 4.3f},
+ {380, 600, 11.8f, 16.5f, 4.4f},
+ {380, 610, 11.8f, 16.0f, 3.0f}
 };
-
 #define ARM_POSE_TABLE_SIZE (sizeof(arm_pose_table) / sizeof(arm_pose_table[0]))
+
+static volatile uint8_t user_button_event = 0;
+static volatile uint8_t auto_abort_requested = 0;
+
+static RobotMode g_mode = ROBOT_MODE_MANUAL;
+static CartesianTarget g_latest_target = {0.0f, 0.0f, 0.0f, 0};
+
+char rx_buffer[RX_BUFFER_SIZE];
+uint8_t rx_index = 0;
+uint8_t rx_data;
+
+volatile uint8_t new_cv_data_ready = 0;
+volatile uint8_t cv_parse_error = 0;
+volatile float latest_cv_x = 0.0f, latest_cv_y = 0.0f, latest_cv_z = 0.0f;
+char debug_raw_rx_string[RX_BUFFER_SIZE];
+
+static float g_world_origin_x = 0.0f;
+static float g_world_origin_y = 0.0f;
+static float g_world_origin_z = 0.0f;
+static float g_world_to_cm_scale = 1.0f;
+
+static int g_map_x = 0, g_map_y = 1, g_map_z = 2;
+static int g_sign_x = 1, g_sign_y = 1, g_sign_z = 1;
+
+volatile uint8_t uart_request_auto = 0;
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -222,198 +228,419 @@ static void MX_GPIO_Init(void);
 static void MX_I2C2_Init(void);
 static void MX_USART3_UART_Init(void);
 static void MX_USB_OTG_FS_PCD_Init(void);
+static void MX_ADC1_Init(void);
 
 /* USER CODE BEGIN PFP */
 void print_msg(const char *msg);
 void print_status_and_halt(const char *msg);
+
 int clamp_int(int value, int min_value, int max_value);
 float clamp_float(float value, float min_value, float max_value);
-float deg_to_rad(float deg);
-float rad_to_deg(float rad);
 
 int servo_limit_count(int channel, int raw_count);
 int servo_apply_direction(int channel, int logical_count);
 HAL_StatusTypeDef servo_write_count(int channel, int logical_count);
-void servo_write_all_centers(void);
 
-void move_servo_smooth_trapezoid(int channel, int target_count,
-                                 float max_speed_cps, float accel_cps2);
-
-int logical_angle_deg_to_count(int channel, float logical_angle_deg);
-float count_to_logical_angle_deg(int channel, int count);
-
-void move_arm_counts(int base_count, int shoulder_count, int elbow_count);
+void write_home_instant(void);
+void move_servo_smooth_trapezoid(int channel, int target_count, float max_speed_cps, float accel_cps2);
+void move_arm_counts(int base_count, int shoulder_count, int elbow_count, float max_speed_cps, float accel_cps2);
 void claw_open(void);
 void claw_close(void);
+void return_home_slow(void);
 
-int solve_ik_workspace(float wx_cm, float wy_cm, float wz_cm,
-                       IKAngles *out_angles, uint8_t *was_clamped);
-int ik_angles_to_counts(const IKAngles *angles, JointCounts *counts);
-int move_to_workspace_point(float wx_cm, float wy_cm, float wz_cm, const char *label);
-void perform_pick_and_place_demo(void);
+uint16_t Joystick_ReadADC(uint32_t channel);
+int Joystick_Normalize(uint16_t raw);
+void Joystick_Read(JoystickState* js, uint32_t x_channel, uint32_t y_channel, GPIO_TypeDef* sw_port, uint16_t sw_pin);
+void manual_mode_step(void);
 
 const EmpiricalArmPose* choose_best_arm_pose(float target_y_cm, float target_z_cm, float *out_cost);
 int estimate_base_count_from_target_x(float target_x_cm, const EmpiricalArmPose *pose);
 int move_to_workspace_point_empirical(float wx_cm, float wy_cm, float wz_cm, const char *label);
+
+int move_to_workspace_point(float wx_cm, float wy_cm, float wz_cm, const char *label);
+
+void service_background(void);
+void delay_with_service(uint32_t delay_ms);
+
+uint8_t take_user_button_event(void);
+void enter_auto_mode(void);
+void leave_auto_mode(void);
+int auto_run_one_cycle(const CartesianTarget *target);
+
+static void world_to_workspace_cm(float in_x_w, float in_y_w, float in_z_w,
+                                  float *out_x_cm, float *out_y_cm, float *out_z_cm);
+static void uart_apply_target_from_world(float x_w, float y_w, float z_w);
+static void uart_handle_line(const char *line);
 /* USER CODE END PFP */
 
-/* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 void print_msg(const char *msg) {
-  HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
+ HAL_UART_Transmit(&huart3, (uint8_t *)msg, strlen(msg), 100);
 }
 
 void print_status_and_halt(const char *msg) {
-  print_msg(msg);
-  HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
-  __disable_irq();
-  while (1) {
-  }
+ print_msg(msg);
+ HAL_GPIO_WritePin(LD1_GPIO_Port, LD1_Pin, GPIO_PIN_SET);
+ __disable_irq();
+ while (1) {}
 }
 
 int clamp_int(int value, int min_value, int max_value) {
-  if (value < min_value) return min_value;
-  if (value > max_value) return max_value;
-  return value;
+ if (value < min_value) return min_value;
+ if (value > max_value) return max_value;
+ return value;
 }
 
 float clamp_float(float value, float min_value, float max_value) {
-  if (value < min_value) return min_value;
-  if (value > max_value) return max_value;
-  return value;
+ if (value < min_value) return min_value;
+ if (value > max_value) return max_value;
+ return value;
 }
 
-float deg_to_rad(float deg) {
-  return deg * ((float)M_PI / 180.0f);
+static void world_to_workspace_cm(float in_x_w, float in_y_w, float in_z_w,
+                                  float *out_x_cm, float *out_y_cm, float *out_z_cm) {
+  float in_adj[3];
+  in_adj[0] = in_x_w - g_world_origin_x;
+  in_adj[1] = in_y_w - g_world_origin_y;
+  in_adj[2] = in_z_w - g_world_origin_z;
+
+  float x_cm = (float)g_sign_x * in_adj[g_map_x] * g_world_to_cm_scale;
+  float y_cm = (float)g_sign_y * in_adj[g_map_y] * g_world_to_cm_scale;
+  float z_cm = (float)g_sign_z * in_adj[g_map_z] * g_world_to_cm_scale;
+
+  if (out_x_cm) *out_x_cm = x_cm;
+  if (out_y_cm) *out_y_cm = y_cm;
+  if (out_z_cm) *out_z_cm = z_cm;
 }
 
-float rad_to_deg(float rad) {
-  return rad * (180.0f / (float)M_PI);
+static void uart_apply_target_from_world(float x_w, float y_w, float z_w) {
+  float x_cm, y_cm, z_cm;
+  world_to_workspace_cm(x_w, y_w, z_w, &x_cm, &y_cm, &z_cm);
+
+  latest_cv_x = x_cm;
+  latest_cv_y = y_cm;
+  latest_cv_z = z_cm;
+  cv_parse_error = 0U;
+  new_cv_data_ready = 1U;
 }
 
-int servo_limit_count(int channel, int raw_count) {
-  return clamp_int(raw_count, servos[channel].min_count, servos[channel].max_count);
-}
+static void uart_handle_line(const char *line) {
+  float x, y, z;
+  float ox, oy, oz;
+  float sc;
+  int mx, my, mz;
+  int sx, sy, sz;
 
-/* If a servo goes the wrong way on hardware, set reversed = 1 in servos[] */
-int servo_apply_direction(int channel, int logical_count) {
-  ServoConfig *s = &servos[channel];
-  int limited = servo_limit_count(channel, logical_count);
+  if (line == NULL) return;
 
-  if (!s->reversed) {
-    return limited;
-  }
+  while ((*line == ' ') || (*line == '\t')) line++;
 
-  return s->center_count - (limited - s->center_count);
-}
-
-HAL_StatusTypeDef servo_write_count(int channel, int logical_count) {
-  int physical_count = servo_apply_direction(channel, logical_count);
-  return PCA9685_SetServoPulseCounts(&hi2c2, channel, physical_count);
-}
-
-void move_servo_smooth_trapezoid(int channel, int target_count,
-                                 float max_speed_cps, float accel_cps2) {
-  char msg[128];
-
-  ServoConfig *s = &servos[channel];
-  const float dt_s = MOTION_DT_MS / 1000.0f;
-
-  const int start_count = s->current_count;
-  const int final_target = servo_limit_count(channel, target_count);
-  const int delta = final_target - start_count;
-
-  if (delta == 0) {
+  if ((strncmp(line, "auto", 4) == 0) || (strncmp(line, "AUTO", 4) == 0)) {
+    uart_request_auto = 1U;
     return;
   }
 
-  const float direction = (delta > 0) ? 1.0f : -1.0f;
-  const float distance = fabsf((float)delta);
-
-  if (max_speed_cps <= 0.0f) max_speed_cps = DEFAULT_MAX_SPEED_CPS;
-  if (accel_cps2 <= 0.0f) accel_cps2 = DEFAULT_ACCEL_CPS2;
-
-  float t_accel = max_speed_cps / accel_cps2;
-  float d_accel = 0.5f * accel_cps2 * t_accel * t_accel;
-
-  float t_cruise = 0.0f;
-  float total_time = 0.0f;
-  float peak_speed = max_speed_cps;
-
-  if (2.0f * d_accel >= distance) {
-    t_accel = sqrtf(distance / accel_cps2);
-    d_accel = 0.5f * accel_cps2 * t_accel * t_accel;
-    t_cruise = 0.0f;
-    peak_speed = accel_cps2 * t_accel;
-    total_time = 2.0f * t_accel;
-  } else {
-    float d_cruise = distance - 2.0f * d_accel;
-    t_cruise = d_cruise / max_speed_cps;
-    total_time = 2.0f * t_accel + t_cruise;
+  if ((strncmp(line, "abort", 5) == 0) || (strncmp(line, "ABORT", 5) == 0)) {
+    if (g_mode == ROBOT_MODE_AUTO) auto_abort_requested = 1U;
+    return;
   }
 
-  snprintf(msg, sizeof(msg), "\r\n%s: %d -> %d\r\n", s->name, start_count, final_target);
-  print_msg(msg);
+  if (sscanf(line, "CFG ORIGIN %f %f %f", &ox, &oy, &oz) == 3) {
+    g_world_origin_x = ox;
+    g_world_origin_y = oy;
+    g_world_origin_z = oz;
+    return;
+  }
 
-  float t = 0.0f;
-  int last_sent = start_count;
+  if (sscanf(line, "CFG SCALE %f", &sc) == 1) {
+    if (sc > 0.000001f) g_world_to_cm_scale = sc;
+    return;
+  }
 
-  while (t < total_time) {
-    float pos = 0.0f;
-
-    if (t < t_accel) {
-      pos = 0.5f * accel_cps2 * t * t;
-    } else if (t < (t_accel + t_cruise)) {
-      float tc = t - t_accel;
-      pos = d_accel + peak_speed * tc;
-    } else {
-      float td = t - t_accel - t_cruise;
-      pos = d_accel + peak_speed * t_cruise +
-            peak_speed * td - 0.5f * accel_cps2 * td * td;
-    }
-
-    if (pos > distance) pos = distance;
-
-    int desired_count = start_count + (int)lroundf(direction * pos);
-    desired_count = servo_limit_count(channel, desired_count);
-
-    if (desired_count != last_sent) {
-      if (servo_write_count(channel, desired_count) != HAL_OK) {
-        print_status_and_halt("ERROR: PCA9685 write failed during motion\r\n");
+  if (sscanf(line, "CFG MAP %d %d %d %d %d %d", &mx, &my, &mz, &sx, &sy, &sz) == 6) {
+    if ((mx >= 0 && mx <= 2) && (my >= 0 && my <= 2) && (mz >= 0 && mz <= 2)) {
+      if ((sx == 1 || sx == -1) && (sy == 1 || sy == -1) && (sz == 1 || sz == -1)) {
+        g_map_x = mx;
+        g_map_y = my;
+        g_map_z = mz;
+        g_sign_x = sx;
+        g_sign_y = sy;
+        g_sign_z = sz;
+        return;
       }
-      last_sent = desired_count;
-    }
-
-    HAL_Delay((uint32_t)MOTION_DT_MS);
-    t += dt_s;
-  }
-
-  if (servo_write_count(channel, final_target) != HAL_OK) {
-    print_status_and_halt("ERROR: PCA9685 final write failed\r\n");
-  }
-
-  s->current_count = final_target;
-}
-
-void servo_write_all_centers(void) {
-  for (int i = 0; i < 4; i++) {
-    servos[i].current_count = servos[i].center_count;
-    if (servo_write_count(i, servos[i].center_count) != HAL_OK) {
-      print_status_and_halt("ERROR: Failed to write center position\r\n");
     }
   }
+
+  if (sscanf(line, "T %f %f %f", &x, &y, &z) == 3 ||
+      sscanf(line, "V %f %f %f", &x, &y, &z) == 3 ||
+      sscanf(line, "PICK %f %f %f", &x, &y, &z) == 3) {
+    uart_apply_target_from_world(x, y, z);
+    return;
+  }
+
+  if (sscanf(line, "%f,%f,%f", &x, &y, &z) == 3 ||
+      sscanf(line, "X=%f,Y=%f,Z=%f", &x, &y, &z) == 3) {
+    uart_apply_target_from_world(x, y, z);
+    return;
+  }
+
+  strncpy(debug_raw_rx_string, line, RX_BUFFER_SIZE - 1);
+  debug_raw_rx_string[RX_BUFFER_SIZE - 1] = '\0';
+  cv_parse_error = 1U;
 }
 
-/* Piecewise linear logical angle -> count.
-   center count = 0 deg
-   min side = negative angle
-   max side = positive angle */
-int logical_angle_deg_to_count(int channel, float logical_angle_deg) {
+int servo_limit_count(int channel, int raw_count) {
+ return clamp_int(raw_count, servos[channel].min_count, servos[channel].max_count);
+}
+
+int servo_apply_direction(int channel, int logical_count) {
+ ServoConfig *s = &servos[channel];
+ int limited = servo_limit_count(channel, logical_count);
+ if (!s->reversed) return limited;
+ return s->center_count - (limited - s->center_count);
+}
+
+HAL_StatusTypeDef servo_write_count(int channel, int logical_count) {
+ int physical_count = servo_apply_direction(channel, logical_count);
+ return PCA9685_SetServoPulseCounts(&hi2c2, channel, physical_count);
+}
+
+void service_background(void) {
+ char msg[128];
+
+ if (uart_request_auto) {
+  uart_request_auto = 0U;
+  enter_auto_mode();
+ }
+
+ if (new_cv_data_ready) {
+ g_latest_target.x_cm = latest_cv_x;
+ g_latest_target.y_cm = latest_cv_y;
+ g_latest_target.z_cm = latest_cv_z;
+ g_latest_target.valid = 1U;
+
+ new_cv_data_ready = 0U;
+
+ snprintf(msg, sizeof(msg), "\r\n[uart] target -> x:%.2f y:%.2f z:%.2f\r\n",
+ latest_cv_x, latest_cv_y, latest_cv_z);
+ print_msg(msg);
+ }
+
+ if (cv_parse_error) {
+ cv_parse_error = 0U;
+ snprintf(msg, sizeof(msg), "\r\n[uart] parse fail: '%s'\r\n", debug_raw_rx_string);
+ print_msg(msg);
+ }
+}
+
+void delay_with_service(uint32_t delay_ms) {
+ uint32_t start = HAL_GetTick();
+ while ((HAL_GetTick() - start) < delay_ms) {
+ service_background();
+ HAL_Delay(1);
+ }
+}
+
+void write_home_instant(void) {
+ servos[BASE_SERVO_MOTOR].current_count = HOME_BASE_COUNT;
+ servos[ARM_SERVO_MOTOR1].current_count = HOME_SHOULDER_COUNT;
+ servos[ARM_SERVO_MOTOR2].current_count = HOME_ELBOW_COUNT;
+ servos[CLAW_SERVO_MOTOR].current_count = HOME_CLAW_COUNT;
+
+ servo_write_count(BASE_SERVO_MOTOR, HOME_BASE_COUNT);
+ servo_write_count(ARM_SERVO_MOTOR1, HOME_SHOULDER_COUNT);
+ servo_write_count(ARM_SERVO_MOTOR2, HOME_ELBOW_COUNT);
+ servo_write_count(CLAW_SERVO_MOTOR, HOME_CLAW_COUNT);
+}
+
+void move_servo_smooth_trapezoid(int channel, int target_count, float max_speed_cps, float accel_cps2) {
+ ServoConfig *s = &servos[channel];
+ const float dt_s = MOTION_DT_MS / 1000.0f;
+ const int start_count = s->current_count;
+ const int final_target = servo_limit_count(channel, target_count);
+ const int delta = final_target - start_count;
+
+ if (delta == 0) return;
+
+ const float direction = (delta > 0) ? 1.0f : -1.0f;
+ const float distance = fabsf((float)delta);
+
+ if (max_speed_cps <= 0.0f) max_speed_cps = DEFAULT_MAX_SPEED_CPS;
+ if (accel_cps2 <= 0.0f) accel_cps2 = DEFAULT_ACCEL_CPS2;
+
+ float t_accel = max_speed_cps / accel_cps2;
+ float d_accel = 0.5f * accel_cps2 * t_accel * t_accel;
+ float t_cruise = 0.0f;
+ float total_time = 0.0f;
+ float peak_speed = max_speed_cps;
+
+ if (2.0f * d_accel >= distance) {
+ t_accel = sqrtf(distance / accel_cps2);
+ d_accel = 0.5f * accel_cps2 * t_accel * t_accel;
+ peak_speed = accel_cps2 * t_accel;
+ total_time = 2.0f * t_accel;
+ } else {
+ float d_cruise = distance - 2.0f * d_accel;
+ t_cruise = d_cruise / max_speed_cps;
+ total_time = 2.0f * t_accel + t_cruise;
+ }
+
+ float t = 0.0f;
+ int last_sent = start_count;
+
+ while (t < total_time) {
+ if (auto_abort_requested && (g_mode == ROBOT_MODE_AUTO)) {
+ s->current_count = last_sent;
+ return;
+ }
+
+ float pos = 0.0f;
+ if (t < t_accel) {
+ pos = 0.5f * accel_cps2 * t * t;
+ } else if (t < (t_accel + t_cruise)) {
+ pos = d_accel + peak_speed * (t - t_accel);
+ } else {
+ float td = t - t_accel - t_cruise;
+ pos = d_accel + peak_speed * t_cruise + peak_speed * td - 0.5f * accel_cps2 * td * td;
+ }
+
+ if (pos > distance) pos = distance;
+ int desired_count = start_count + (int)lroundf(direction * pos);
+ desired_count = servo_limit_count(channel, desired_count);
+
+ if (desired_count != last_sent) {
+ servo_write_count(channel, desired_count);
+ last_sent = desired_count;
+ }
+
+ delay_with_service((uint32_t)MOTION_DT_MS);
+ t += dt_s;
+ }
+
+ servo_write_count(channel, final_target);
+ s->current_count = final_target;
+}
+
+void move_arm_counts(int base_count, int shoulder_count, int elbow_count, float max_speed_cps, float accel_cps2) {
+ move_servo_smooth_trapezoid(BASE_SERVO_MOTOR, base_count, max_speed_cps, accel_cps2);
+ if (auto_abort_requested && (g_mode == ROBOT_MODE_AUTO)) return;
+ delay_with_service(200);
+
+ move_servo_smooth_trapezoid(ARM_SERVO_MOTOR1, shoulder_count, max_speed_cps, accel_cps2);
+ if (auto_abort_requested && (g_mode == ROBOT_MODE_AUTO)) return;
+ delay_with_service(200);
+
+ move_servo_smooth_trapezoid(ARM_SERVO_MOTOR2, elbow_count, max_speed_cps, accel_cps2);
+ delay_with_service(300);
+}
+
+void claw_open(void) {
+ print_msg("[arm] opening claw\r\n");
+ move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_OPEN_HOLD_COUNT, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ delay_with_service(350);
+}
+
+void claw_close(void) {
+ print_msg("[arm] closing claw\r\n");
+ move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_CLOSE_COUNT, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ delay_with_service(350);
+}
+
+void return_home_slow(void) {
+ print_msg("[arm] returning home\r\n");
+ move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, HOME_CLAW_COUNT, HOME_RETURN_MAX_SPEED_CPS, HOME_RETURN_ACCEL_CPS2);
+ delay_with_service(200);
+
+ move_arm_counts(HOME_BASE_COUNT, HOME_SHOULDER_COUNT, HOME_ELBOW_COUNT, HOME_RETURN_MAX_SPEED_CPS, HOME_RETURN_ACCEL_CPS2);
+ print_msg("[arm] home reached\r\n");
+}
+
+uint16_t Joystick_ReadADC(uint32_t channel) {
+ ADC_ChannelConfTypeDef sConfig = {0};
+ sConfig.Channel = channel;
+ sConfig.Rank = 1;
+ sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+
+ if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) return 0;
+ HAL_ADC_Start(&hadc1);
+ if (HAL_ADC_PollForConversion(&hadc1, 10) != HAL_OK) {
+ HAL_ADC_Stop(&hadc1);
+ return 0;
+ }
+ uint16_t value = (uint16_t)HAL_ADC_GetValue(&hadc1);
+ HAL_ADC_Stop(&hadc1);
+ return value;
+}
+
+int Joystick_Normalize(uint16_t raw) {
+ int val = (int)raw - JOY_CENTER;
+ if (abs(val) < JOY_DEADZONE) return 0;
+ return val;
+}
+
+void Joystick_Read(JoystickState* js, uint32_t x_channel, uint32_t y_channel, GPIO_TypeDef* sw_port, uint16_t sw_pin) {
+ js->x_raw = Joystick_ReadADC(x_channel);
+ js->y_raw = Joystick_ReadADC(y_channel);
+ js->x_norm = Joystick_Normalize(js->x_raw);
+ js->y_norm = Joystick_Normalize(js->y_raw);
+ js->button = (HAL_GPIO_ReadPin(sw_port, sw_pin) == GPIO_PIN_RESET) ? 1U : 0U;
+}
+
+void manual_mode_step(void) {
+ JoystickState joy1 = {0};
+ JoystickState joy2 = {0};
+
+ Joystick_Read(&joy1, J1_X_CHANNEL, J1_Y_CHANNEL, J1_SW_GPIO_Port, J1_SW_Pin);
+ Joystick_Read(&joy2, J2_X_CHANNEL, J2_Y_CHANNEL, J2_SW_GPIO_Port, J2_SW_Pin);
+
+ int base_step = (int)(JOYSTICK_STEP_SIZE_COUNTS * (float)abs(joy1.x_norm) / (float)(JOY_MAX - JOY_DEADZONE));
+ int shoulder_step = (int)(JOYSTICK_STEP_SIZE_COUNTS * (float)abs(joy1.y_norm) / (float)(JOY_MAX - JOY_DEADZONE));
+ int elbow_step = (int)(JOYSTICK_STEP_SIZE_COUNTS * (float)abs(joy2.x_norm) / (float)(JOY_MAX - JOY_DEADZONE));
+ int claw_step = (int)(JOYSTICK_STEP_SIZE_COUNTS * (float)abs(joy2.y_norm) / (float)(JOY_MAX - JOY_DEADZONE));
+
+ if (joy1.x_norm > JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(BASE_SERVO_MOTOR, servos[BASE_SERVO_MOTOR].current_count + base_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ } else if (joy1.x_norm < -JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(BASE_SERVO_MOTOR, servos[BASE_SERVO_MOTOR].current_count - base_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ }
+
+ if (joy1.y_norm > JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(ARM_SERVO_MOTOR1, servos[ARM_SERVO_MOTOR1].current_count + shoulder_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ } else if (joy1.y_norm < -JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(ARM_SERVO_MOTOR1, servos[ARM_SERVO_MOTOR1].current_count - shoulder_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ }
+
+ if (joy2.x_norm > JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(ARM_SERVO_MOTOR2, servos[ARM_SERVO_MOTOR2].current_count + elbow_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ } else if (joy2.x_norm < -JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(ARM_SERVO_MOTOR2, servos[ARM_SERVO_MOTOR2].current_count - elbow_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ }
+
+ if (joy2.y_norm > JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, servos[CLAW_SERVO_MOTOR].current_count + claw_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ } else if (joy2.y_norm < -JOY_DEADZONE) {
+ move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, servos[CLAW_SERVO_MOTOR].current_count - claw_step, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ }
+
+ delay_with_service(20);
+}
+
+static float sqrf(float x) { return x * x; }
+
+static float deg_to_rad(float deg) {
+  return deg * (float)(M_PI / 180.0f);
+}
+
+static float rad_to_deg(float rad) {
+  return rad * (float)(180.0f / (float)M_PI);
+}
+
+static int logical_angle_deg_to_count(int channel, float logical_angle_deg) {
   ServoConfig *s = &servos[channel];
+
   float min_deg = 0.0f;
   float max_deg = 0.0f;
-  float count_f = (float)s->center_count;
 
   if (channel == BASE_SERVO_MOTOR) {
     min_deg = BASE_MIN_DEG;
@@ -428,131 +655,77 @@ int logical_angle_deg_to_count(int channel, float logical_angle_deg) {
     return s->center_count;
   }
 
+  float count_f = (float)s->center_count;
+
   if (logical_angle_deg >= 0.0f) {
     float a = clamp_float(logical_angle_deg, 0.0f, max_deg);
     float t = (max_deg == 0.0f) ? 0.0f : (a / max_deg);
-    count_f = (float)s->center_count +
-              t * ((float)s->max_count - (float)s->center_count);
+    count_f = (float)s->center_count + t * ((float)s->max_count - (float)s->center_count);
   } else {
     float a = clamp_float(logical_angle_deg, min_deg, 0.0f);
-    float t = (min_deg == 0.0f) ? 0.0f : (a / min_deg);
-    count_f = (float)s->center_count +
-              t * ((float)s->min_count - (float)s->center_count);
+    float t = (min_deg == 0.0f) ? 0.0f : (a / min_deg); /* min_deg is negative */
+    count_f = (float)s->center_count + t * ((float)s->min_count - (float)s->center_count);
   }
 
   return servo_limit_count(channel, (int)lroundf(count_f));
 }
 
-float count_to_logical_angle_deg(int channel, int count) {
-  ServoConfig *s = &servos[channel];
-  int limited = servo_limit_count(channel, count);
-
-  if (limited >= s->center_count) {
-    float t = ((float)limited - (float)s->center_count) /
-              ((float)s->max_count - (float)s->center_count);
-    if (channel == BASE_SERVO_MOTOR) return t * BASE_MAX_DEG;
-    if (channel == ARM_SERVO_MOTOR1) return t * SHOULDER_MAX_DEG;
-    if (channel == ARM_SERVO_MOTOR2) return t * ELBOW_MAX_DEG;
-  } else {
-    float t = ((float)limited - (float)s->center_count) /
-              ((float)s->center_count - (float)s->min_count);
-    if (channel == BASE_SERVO_MOTOR) return t * (-BASE_MIN_DEG);
-    if (channel == ARM_SERVO_MOTOR1) return t * (-SHOULDER_MIN_DEG);
-    if (channel == ARM_SERVO_MOTOR2) return t * (-ELBOW_MIN_DEG);
-  }
-
-  return 0.0f;
-}
-
-void move_arm_counts(int base_count, int shoulder_count, int elbow_count) {
-  move_servo_smooth_trapezoid(BASE_SERVO_MOTOR, base_count,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(200);
-
-  move_servo_smooth_trapezoid(ARM_SERVO_MOTOR1, shoulder_count,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(200);
-
-  move_servo_smooth_trapezoid(ARM_SERVO_MOTOR2, elbow_count,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(300);
-}
-
-void claw_open(void) {
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_MAX_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(350);
-}
-
-void claw_close(void) {
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_MIN_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(350);
-}
-
-/* Solve IK for workspace point (wx, wy, wz), cm */
-int solve_ik_workspace(float wx_cm, float wy_cm, float wz_cm,
-                       IKAngles *out_angles, uint8_t *was_clamped) {
+static int solve_ik_workspace(float wx_cm, float wy_cm, float wz_cm,
+                               IKAngles *out_angles, uint8_t *was_clamped) {
   if (out_angles == NULL) return 0;
-  if (was_clamped) *was_clamped = 0;
+  if (was_clamped) *was_clamped = 0U;
 
-  /* Relative to base axis projection */
-  float x_rel = wx_cm - BASE_X_CM;
-  float y_rel = wy_cm - BASE_Y_CM;
+  float x_rel = wx_cm - IK_BASE_X_CM;
+  float y_rel = wy_cm - IK_BASE_Y_CM;
 
-  /* Neutral base points straight toward paper, i.e. +y */
+  /* 0 deg points toward +y (paper away from robot), positive rotates toward +x (paper left) */
   float base_deg = rad_to_deg(atan2f(x_rel, y_rel));
 
-  /* Shoulder plane coordinates */
   float r = sqrtf(x_rel * x_rel + y_rel * y_rel);
-  float z = wz_cm - SHOULDER_Z_CM;
+  float z = wz_cm - IK_SHOULDER_Z_CM;
 
   float d = sqrtf(r * r + z * z);
-  float max_reach = (LINK1_CM + LINK2_CM) - REACH_MARGIN_CM;
-  float min_reach = fabsf(LINK1_CM - LINK2_CM) + REACH_MARGIN_CM;
+  float max_reach = (IK_LINK1_CM + IK_LINK2_CM) - IK_REACH_MARGIN_CM;
+  float min_reach = fabsf(IK_LINK1_CM - IK_LINK2_CM) + IK_REACH_MARGIN_CM;
 
   if ((d > max_reach) || (d < min_reach)) {
-#if CLAMP_UNREACHABLE_TARGETS
+    if (!IK_CLAMP_UNREACHABLE_TARGETS) {
+      return 0;
+    }
+
     float d_safe = clamp_float(d, min_reach, max_reach);
     if (d > 1e-6f) {
-      float scale = d_safe / d;
-      r *= scale;
-      z *= scale;
+      float s = d_safe / d;
+      r *= s;
+      z *= s;
     } else {
       r = min_reach;
       z = 0.0f;
     }
-    if (was_clamped) *was_clamped = 1;
-#else
-    return 0;
-#endif
+
+    if (was_clamped) *was_clamped = 1U;
   }
 
-  float D = (r * r + z * z - LINK1_CM * LINK1_CM - LINK2_CM * LINK2_CM) /
-            (2.0f * LINK1_CM * LINK2_CM);
+  float D = (r * r + z * z - IK_LINK1_CM * IK_LINK1_CM - IK_LINK2_CM * IK_LINK2_CM) /
+            (2.0f * IK_LINK1_CM * IK_LINK2_CM);
   D = clamp_float(D, -1.0f, 1.0f);
 
-  /* Geometric elbow bend */
   float beta_rad = acosf(D);
   float beta_deg = rad_to_deg(beta_rad);
 
-  /* Geometric shoulder absolute angle relative to +r axis */
   float phi_rad = atan2f(z, r) -
-                  atan2f(LINK2_CM * sinf(beta_rad),
-                         LINK1_CM + LINK2_CM * cosf(beta_rad));
+                  atan2f(IK_LINK2_CM * sinf(beta_rad),
+                         IK_LINK1_CM + IK_LINK2_CM * cosf(beta_rad));
   float phi_deg = rad_to_deg(phi_rad);
 
-  /* Convert geometric angles to logical angles relative to neutral counts */
-  out_angles->base_deg = base_deg - BASE_FORWARD_ABS_DEG;
-  out_angles->shoulder_deg = phi_deg - SHOULDER_NEUTRAL_ABS_DEG;
-
-  /* Positive logical elbow = extend outward. Geometric beta gets smaller when extending. */
-  out_angles->elbow_deg = ELBOW_NEUTRAL_REL_DEG - beta_deg;
+  out_angles->base_deg = base_deg - IK_BASE_FORWARD_ABS_DEG;
+  out_angles->shoulder_deg = phi_deg - IK_SHOULDER_NEUTRAL_ABS_DEG;
+  out_angles->elbow_deg = IK_ELBOW_NEUTRAL_REL_DEG - beta_deg;
 
   return 1;
 }
 
-int ik_angles_to_counts(const IKAngles *angles, JointCounts *counts) {
+static int ik_angles_to_counts(const IKAngles *angles, JointCounts *counts) {
   if ((angles == NULL) || (counts == NULL)) return 0;
 
   counts->base_count = logical_angle_deg_to_count(BASE_SERVO_MOTOR, angles->base_deg);
@@ -563,476 +736,395 @@ int ik_angles_to_counts(const IKAngles *angles, JointCounts *counts) {
 }
 
 int move_to_workspace_point(float wx_cm, float wy_cm, float wz_cm, const char *label) {
-  char msg[256];
   IKAngles angles;
   JointCounts counts;
   uint8_t was_clamped = 0;
 
-  snprintf(msg, sizeof(msg),
-           "\r\nTarget %s: W=(%.2f, %.2f, %.2f cm)\r\n",
-           label, wx_cm, wy_cm, wz_cm);
-  print_msg(msg);
+  (void)label;
 
   if (!solve_ik_workspace(wx_cm, wy_cm, wz_cm, &angles, &was_clamped)) {
-    print_msg("IK solve failed\r\n");
-    return 0;
+    /* if geometry is way off, fall back to the empirical table */
+    return move_to_workspace_point_empirical(wx_cm, wy_cm, wz_cm, label);
   }
 
   if (!ik_angles_to_counts(&angles, &counts)) {
-    print_msg("IK angle->count conversion failed\r\n");
-    return 0;
+    return move_to_workspace_point_empirical(wx_cm, wy_cm, wz_cm, label);
   }
 
-  snprintf(msg, sizeof(msg),
-           "IK angles (deg): base=%.2f shoulder=%.2f elbow=%.2f%s\r\n",
-           angles.base_deg, angles.shoulder_deg, angles.elbow_deg,
-           was_clamped ? " [CLAMPED]" : "");
-  print_msg(msg);
+  move_arm_counts(counts.base_count, counts.shoulder_count, counts.elbow_count, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
 
-  snprintf(msg, sizeof(msg),
-           "Counts: base=%d shoulder=%d elbow=%d\r\n",
-           counts.base_count, counts.shoulder_count, counts.elbow_count);
-  print_msg(msg);
+  /* allow uart service to run briefly between moves */
+  delay_with_service(300);
 
-  move_arm_counts(counts.base_count, counts.shoulder_count, counts.elbow_count);
-  HAL_Delay(400);
-
+  (void)was_clamped;
   return 1;
-}
-//void perform_pick_and_place_demo(void) {
-//  print_msg("\r\n===== EMPIRICAL CALIBRATION-BASED MOVE TEST =====\r\n");
-//
-//  servo_write_all_centers();
-//  HAL_Delay(1500);
-//
-//  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, EMPIRICAL_CLAW_COUNT,
-//                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-//  HAL_Delay(400);
-//
-//  /* Try targets that are actually inside your calibrated region first. */
-//
-//  if (!move_to_workspace_point_empirical(11.5f, 13.0f, 4.5f, "test 1")) {
-//    print_msg("Empirical move failed\r\n");
-//    return;
-//  }
-//  HAL_Delay(2000);
-//
-//  if (!move_to_workspace_point_empirical(7.0f, 15.0f, 4.5f, "test 2")) {
-//    print_msg("Empirical move failed\r\n");
-//    return;
-//  }
-//  HAL_Delay(2000);
-//
-//  if (!move_to_workspace_point_empirical(16.0f, 15.0f, 4.5f, "test 3")) {
-//    print_msg("Empirical move failed\r\n");
-//    return;
-//  }
-//  HAL_Delay(2000);
-//
-//  print_msg("\r\nHolding final empirical pose...\r\n");
-//}
-
-void perform_pick_and_place_demo(void) {
-  print_msg("\r\n===== EMPIRICAL PICK TEST =====\r\n");
-
-  servo_write_all_centers();
-  HAL_Delay(1500);
-
-  /* Start open */
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_OPEN_HOLD_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(400);
-
-  /* Move to one target point using empirical solver */
-  if (!move_to_workspace_point_empirical(4.0f, 12.0f, 4.5f, "pickup target")) {
-    print_msg("Empirical move failed\r\n");
-  }
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_CLOSE_COUNT,
-                                DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(5000);
-
-  if (!move_to_workspace_point_empirical(7.0f, 15.0f, 4.5f, "pickup target")) {
-      print_msg("Empirical move failed\r\n");
-    }
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_CLOSE_COUNT,
-                                DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-    HAL_Delay(5000);
-
-    if (!move_to_workspace_point_empirical(3.5f, 11.0f, 4.5f, "pickup target")) {
-        print_msg("Empirical move failed\r\n");
-      }
-    move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_CLOSE_COUNT,
-                                  DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-      HAL_Delay(5000);
-
-      if (!move_to_workspace_point_empirical(20.5f, 12.0f, 4.5f, "pickup target")) {
-          print_msg("Empirical move failed\r\n");
-        }
-      move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_CLOSE_COUNT,
-                                    DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-        HAL_Delay(5000);
-
-  /* Close only after arm has fully moved */
-  HAL_Delay(500);
-
-  print_msg("\r\nHolding final grasp pose...\r\n");
-}
-
-
-void manual_touch_pose_test(void) {
-  print_msg("\r\n===== MANUAL TOUCH POSE TEST =====\r\n");
-
-  /* Optional: comment this out if you do not want auto-centering first */
-  // servo_write_all_centers();
-  // HAL_Delay(1000);
-
-  /* IMPORTANT:
-     We assume servos[].current_count already roughly matches the arm's
-     physical current pose. If startup jerk is a problem, do NOT call
-     servo_write_all_centers() before this.
-  */
-
-  move_servo_smooth_trapezoid(BASE_SERVO_MOTOR, MANUAL_BASE_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(300);
-
-  move_servo_smooth_trapezoid(ARM_SERVO_MOTOR1, MANUAL_SHOULDER_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(300);
-
-  move_servo_smooth_trapezoid(ARM_SERVO_MOTOR2, MANUAL_ELBOW_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(300);
-
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, MANUAL_CLAW_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(300);
-
-  char msg[200];
-  snprintf(msg, sizeof(msg),
-           "Holding manual pose: base=%d shoulder=%d elbow=%d claw=%d\r\n",
-           MANUAL_BASE_COUNT, MANUAL_SHOULDER_COUNT,
-           MANUAL_ELBOW_COUNT, MANUAL_CLAW_COUNT);
-  print_msg(msg);
-}
-
-
-static float sqrf(float x) {
-  return x * x;
 }
 
 const EmpiricalArmPose* choose_best_arm_pose(float target_y_cm, float target_z_cm, float *out_cost) {
-  const EmpiricalArmPose *best_pose = NULL;
-  float best_cost = 1e9f;
+ const EmpiricalArmPose *best_pose = NULL;
+ float best_cost = 1e9f;
 
-  for (uint32_t i = 0; i < ARM_POSE_TABLE_SIZE; i++) {
-    const EmpiricalArmPose *p = &arm_pose_table[i];
+ for (uint32_t i = 0; i < ARM_POSE_TABLE_SIZE; i++) {
+ const EmpiricalArmPose *p = &arm_pose_table[i];
+ float dy = target_y_cm - p->y_cm;
+ float dz = target_z_cm - p->z_cm;
+ float cost = 1.0f * sqrf(dy) + 1.6f * sqrf(dz);
 
-    float dy = target_y_cm - p->y_cm;
-    float dz = target_z_cm - p->z_cm;
-
-    /* Make z matter slightly more now because you want grab height near 4.5 */
-    float cost = 1.0f * sqrf(dy) + 1.6f * sqrf(dz);
-
-    if (cost < best_cost) {
-      best_cost = cost;
-      best_pose = p;
-    }
-  }
-
-  if (out_cost) {
-    *out_cost = best_cost;
-  }
-
-  return best_pose;
+ if (cost < best_cost) {
+ best_cost = cost;
+ best_pose = p;
+ }
+ }
+ if (out_cost) *out_cost = best_cost;
+ return best_pose;
 }
 
 int estimate_base_count_from_target_x(float target_x_cm, const EmpiricalArmPose *pose) {
-  if (pose == NULL) {
-    return BASE_CENTER_COUNT;
-  }
-
-  /* At base=450, this pose was measured at pose->x_cm.
-     Shift base count so the arm moves from the measured x to the desired x. */
-  float delta_x = target_x_cm - pose->x_cm;
-  float raw_base = 450.0f + BASE_COUNTS_PER_CM_X * delta_x;
-
-  int base_count = (int)lroundf(raw_base);
-
-  /* Keep inside safe ROM */
-  return servo_limit_count(BASE_SERVO_MOTOR, base_count);
+ if (pose == NULL) return BASE_CENTER_COUNT;
+ float delta_x = target_x_cm - pose->x_cm;
+ float raw_base = 450.0f + BASE_COUNTS_PER_CM_X * delta_x;
+ return servo_limit_count(BASE_SERVO_MOTOR, (int)lroundf(raw_base));
 }
 
 int move_to_workspace_point_empirical(float wx_cm, float wy_cm, float wz_cm, const char *label) {
-  char msg[256];
+ char msg[256];
 
-  float clamped_y = clamp_float(wy_cm, CAL_Y_MIN_CM, CAL_Y_MAX_CM);
-  float clamped_z = clamp_float(wz_cm, CAL_Z_MIN_CM, CAL_Z_MAX_CM);
+ print_msg("[arm] calculating trajectory\r\n");
 
-  float best_cost = 0.0f;
-  const EmpiricalArmPose *best_pose = choose_best_arm_pose(clamped_y, clamped_z, &best_cost);
-  if (best_pose == NULL) {
-    print_msg("Empirical pose lookup failed\r\n");
-    return 0;
-  }
+ float clamped_y = clamp_float(wy_cm, CAL_Y_MIN_CM, CAL_Y_MAX_CM);
+ float clamped_z = clamp_float(wz_cm, CAL_Z_MIN_CM, CAL_Z_MAX_CM);
 
-  int base_count = estimate_base_count_from_target_x(wx_cm, best_pose);
+ float best_cost = 0.0f;
+ const EmpiricalArmPose *best_pose = choose_best_arm_pose(clamped_y, clamped_z, &best_cost);
 
-  snprintf(msg, sizeof(msg),
-           "\r\nEmpirical target %s: W=(%.2f, %.2f, %.2f)\r\n",
-           label, wx_cm, wy_cm, wz_cm);
-  print_msg(msg);
+ if (best_pose == NULL) {
+  print_msg("[arm] pose lookup failed (out of bounds?)\r\n");
+ return 0;
+ }
 
-  if ((wy_cm != clamped_y) || (wz_cm != clamped_z)) {
-    snprintf(msg, sizeof(msg),
-             "WARNING: target outside calibrated Y/Z region, using nearest in-range Y/Z = (%.2f, %.2f)\r\n",
-             clamped_y, clamped_z);
-    print_msg(msg);
-  }
+ int base_count = estimate_base_count_from_target_x(wx_cm, best_pose);
 
-  snprintf(msg, sizeof(msg),
-           "Chosen arm pose: shoulder=%d elbow=%d -> approx actual (x=%.2f, y=%.2f, z=%.2f), cost=%.2f\r\n",
-           best_pose->shoulder_count, best_pose->elbow_count,
-           best_pose->x_cm, best_pose->y_cm, best_pose->z_cm, best_cost);
-  print_msg(msg);
+ snprintf(msg, sizeof(msg), ">>> Moving to Target '%s': W=(%.2f, %.2f, %.2f)\r\n", label, wx_cm, wy_cm, wz_cm);
+ print_msg(msg);
 
-  snprintf(msg, sizeof(msg),
-           "Estimated counts: base=%d shoulder=%d elbow=%d, claw(open)=%d\r\n",
-           base_count, best_pose->shoulder_count, best_pose->elbow_count, CLAW_OPEN_HOLD_COUNT);
-  print_msg(msg);
+ /* move without changing the claw position */
+ move_arm_counts(base_count, best_pose->shoulder_count, best_pose->elbow_count, DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
+ if (auto_abort_requested && (g_mode == ROBOT_MODE_AUTO)) return 0;
+ delay_with_service(400);
 
-  /* KEEP CLAW OPEN FIRST */
-  move_servo_smooth_trapezoid(CLAW_SERVO_MOTOR, CLAW_OPEN_HOLD_COUNT,
-                              DEFAULT_MAX_SPEED_CPS, DEFAULT_ACCEL_CPS2);
-  HAL_Delay(250);
-
-  /* MOVE ALL OTHER JOINTS */
-  move_arm_counts(base_count, best_pose->shoulder_count, best_pose->elbow_count);
-  HAL_Delay(400);
-
-  return 1;
+ print_msg("[arm] movement complete\r\n");
+ return 1;
 }
+
+uint8_t take_user_button_event(void) {
+ uint8_t had_event = user_button_event;
+ user_button_event = 0U;
+ return had_event;
+}
+
+void enter_auto_mode(void) {
+ auto_abort_requested = 0U;
+ g_mode = ROBOT_MODE_AUTO;
+  g_latest_target.valid = 0U;
+  print_msg("\r\n[main] auto mode\r\n");
+  print_msg("[main] waiting for a target from the host\r\n");
+}
+
+void leave_auto_mode(void) {
+ auto_abort_requested = 0U;
+  print_msg("\r\n[main] aborting auto sequence\r\n");
+ return_home_slow();
+ g_mode = ROBOT_MODE_MANUAL;
+  print_msg("\r\n[main] manual mode\r\n");
+}
+
+int auto_run_one_cycle(const CartesianTarget *target) {
+ float lift_z = 0.0f;
+  float drop_z = 0.0f;
+
+ if ((target == NULL) || (!target->valid)) return 0;
+
+ print_msg("\r\n[auto] pick/place cycle\r\n");
+
+ claw_open();
+ if (auto_abort_requested) return 0;
+
+ if (!move_to_workspace_point(target->x_cm, target->y_cm, target->z_cm, "Pickup Object")) return 0;
+ if (auto_abort_requested) return 0;
+
+ claw_close();
+ if (auto_abort_requested) return 0;
+
+ print_msg("[auto] lifting\r\n");
+ lift_z = clamp_float(target->z_cm + AUTO_LIFT_DELTA_Z_CM, AUTO_Z_MIN_CM, AUTO_Z_MAX_CM);
+ if (!move_to_workspace_point(target->x_cm, target->y_cm, lift_z, "Lift Object")) return 0;
+ if (auto_abort_requested) return 0;
+
+ drop_z = clamp_float(target->z_cm, AUTO_Z_MIN_CM, AUTO_Z_MAX_CM);
+ if (!move_to_workspace_point(AUTO_DROP_X_CM, AUTO_DROP_Y_CM, drop_z, "Drop Zone")) return 0;
+ if (auto_abort_requested) return 0;
+
+ claw_open();
+ if (auto_abort_requested) return 0;
+
+ return_home_slow();
+ print_msg("[auto] cycle complete\r\n");
+
+ return 1;
+}
+
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin) {
+ if (GPIO_Pin == USER_Btn_Pin) {
+ user_button_event = 1U;
+ if (g_mode == ROBOT_MODE_AUTO) {
+ auto_abort_requested = 1U;
+ }
+ }
+}
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
+ if (huart->Instance == USART3) {
+ if (rx_data == '\n') {
+ rx_buffer[rx_index] = '\0';
+
+   uart_handle_line(rx_buffer);
+ rx_index = 0;
+ }
+ else if (rx_data != '\r') {
+ if (rx_index < RX_BUFFER_SIZE - 1) {
+ rx_buffer[rx_index++] = rx_data;
+ }
+ }
+
+ HAL_UART_Receive_IT(&huart3, &rx_data, 1);
+ }
+}
+
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void) {
-  HAL_Init();
+ HAL_StatusTypeDef status;
 
-  SystemClock_Config();
+ HAL_Init();
+ SystemClock_Config();
 
-  MX_GPIO_Init();
-  MX_I2C2_Init();
-  MX_USART3_UART_Init();
-  MX_USB_OTG_FS_PCD_Init();
+ MX_GPIO_Init();
+ MX_I2C2_Init();
+ MX_USART3_UART_Init();
+ MX_USB_OTG_FS_PCD_Init();
+ MX_ADC1_Init();
 
-  /* USER CODE BEGIN 2 */
-  HAL_StatusTypeDef status;
+ print_msg("\r\n==========================================\r\n");
+ print_msg("[main] init started\r\n");
 
-  print_msg("\r\nStarting IK pick-and-place demo...\r\n");
+ status = PCA9685_IsReady(&hi2c2);
+ if (status != HAL_OK) {
+ print_status_and_halt("[main] error: pca9685 not found on i2c\r\n");
+ }
+ HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
+ print_msg("[main] pca9685 detected\r\n");
 
-  status = PCA9685_IsReady(&hi2c2);
-  if (status != HAL_OK) {
-    print_status_and_halt("ERROR: PCA9685 not found on I2C bus\r\n");
-  }
+ status = PCA9685_Init(&hi2c2);
+ if (status != HAL_OK) print_status_and_halt("[main] error: pca9685 init failed\r\n");
 
-  HAL_GPIO_WritePin(LD3_GPIO_Port, LD3_Pin, GPIO_PIN_SET);
-  print_msg("PCA9685 found on I2C bus\r\n");
+ status = PCA9685_SetPWMFreq(&hi2c2, 50.0f);
+ if (status != HAL_OK) print_status_and_halt("[main] error: pwm setup failed\r\n");
 
-  status = PCA9685_Init(&hi2c2);
-  if (status != HAL_OK) {
-    print_status_and_halt("ERROR: PCA9685 init failed\r\n");
-  }
-  print_msg("PCA9685 init OK\r\n");
+ print_msg("[main] moving home\r\n");
+ write_home_instant();
+ delay_with_service(1200);
 
-  status = PCA9685_SetPWMFreq(&hi2c2, 50.0f);
-  if (status != HAL_OK) {
-    print_status_and_halt("ERROR: PCA9685 PWM frequency setup failed\r\n");
-  }
-  print_msg("PCA9685 PWM set to 50 Hz\r\n");
+ print_msg("[main] init complete\r\n");
+ print_msg("mode: manual (joystick)\r\n");
+ print_msg("Press Blue USER Button to switch to AUTO mode.\r\n");
+ print_msg("==========================================\r\n");
 
-  servo_write_all_centers();
-  print_msg("All servos moved to center\r\n");
-  HAL_Delay(1500);
+ HAL_UART_Receive_IT(&huart3, &rx_data, 1);
 
-  perform_pick_and_place_demo();
-  //manual_touch_pose_test();
+ uint32_t last_waiting_print = 0;
 
+ while (1) {
+ service_background();
 
-  print_msg("\r\nDemo complete. Holding position.\r\n");
-  HAL_GPIO_WritePin(LD2_GPIO_Port, LD2_Pin, GPIO_PIN_SET);
-  /* USER CODE END 2 */
+ if (take_user_button_event()) {
+ print_msg("\r\n[main] blue button\r\n");
+ if (g_mode == ROBOT_MODE_MANUAL) {
+ enter_auto_mode();
+ } else {
+ print_msg("[main] interrupting auto (abort)\r\n");
+ }
+ }
 
-  while (1) {
-    HAL_Delay(1000);
-  }
+ if (g_mode == ROBOT_MODE_MANUAL) {
+ manual_mode_step();
+ continue;
+ }
+
+ if (auto_abort_requested) {
+ leave_auto_mode();
+ continue;
+ }
+
+ if (!g_latest_target.valid) {
+ if (HAL_GetTick() - last_waiting_print > 2000) {
+   print_msg("[auto] waiting for target...\r\n");
+ last_waiting_print = HAL_GetTick();
+ }
+ delay_with_service(100);
+ continue;
+ }
+
+ {
+ CartesianTarget target_snapshot = g_latest_target;
+ auto_run_one_cycle(&target_snapshot);
+ }
+
+ if (auto_abort_requested) {
+ leave_auto_mode();
+ continue;
+ }
+
+ print_msg("[auto] cycle done, waiting...\r\n");
+ g_latest_target.valid = 0;
+ delay_with_service(AUTO_WAIT_BETWEEN_CYCLES_MS);
+
+ if (auto_abort_requested) {
+ leave_auto_mode();
+ continue;
+ }
+ }
 }
 
-/**
-  * @brief System Clock Configuration
-  * @retval None
-  */
 void SystemClock_Config(void) {
-  RCC_OscInitTypeDef RCC_OscInitStruct = {0};
-  RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
+ RCC_OscInitTypeDef RCC_OscInitStruct = {0};
+ RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  __HAL_RCC_PWR_CLK_ENABLE();
-  __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
+ __HAL_RCC_PWR_CLK_ENABLE();
+ __HAL_PWR_VOLTAGESCALING_CONFIG(PWR_REGULATOR_VOLTAGE_SCALE1);
 
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
-  RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = 4;
-  RCC_OscInitStruct.PLL.PLLN = 168;
-  RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
-  RCC_OscInitStruct.PLL.PLLQ = 7;
-  RCC_OscInitStruct.PLL.PLLR = 2;
+ RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+ RCC_OscInitStruct.HSEState = RCC_HSE_BYPASS;
+ RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
+ RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+ RCC_OscInitStruct.PLL.PLLM = 4;
+ RCC_OscInitStruct.PLL.PLLN = 168;
+ RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+ RCC_OscInitStruct.PLL.PLLQ = 7;
+ RCC_OscInitStruct.PLL.PLLR = 2;
 
-  if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) {
-    Error_Handler();
-  }
+ if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK) Error_Handler();
 
-  RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK |
-                                RCC_CLOCKTYPE_SYSCLK |
-                                RCC_CLOCKTYPE_PCLK1 |
-                                RCC_CLOCKTYPE_PCLK2;
-  RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
-  RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
-  RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
-  RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
+ RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK | RCC_CLOCKTYPE_SYSCLK | RCC_CLOCKTYPE_PCLK1 | RCC_CLOCKTYPE_PCLK2;
+ RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
+ RCC_ClkInitStruct.AHBCLKDivider = RCC_SYSCLK_DIV1;
+ RCC_ClkInitStruct.APB1CLKDivider = RCC_HCLK_DIV4;
+ RCC_ClkInitStruct.APB2CLKDivider = RCC_HCLK_DIV2;
 
-  if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) {
-    Error_Handler();
-  }
+ if (HAL_RCC_ClockConfig(&RCC_ClkInitStruct, FLASH_LATENCY_5) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief I2C2 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_I2C2_Init(void) {
-  hi2c2.Instance = I2C2;
-  hi2c2.Init.ClockSpeed = 400000;
-  hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
-  hi2c2.Init.OwnAddress1 = 0;
-  hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
-  hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
-  hi2c2.Init.OwnAddress2 = 0;
-  hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
-  hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
-
-  if (HAL_I2C_Init(&hi2c2) != HAL_OK) {
-    Error_Handler();
-  }
+ hi2c2.Instance = I2C2;
+ hi2c2.Init.ClockSpeed = 400000;
+ hi2c2.Init.DutyCycle = I2C_DUTYCYCLE_2;
+ hi2c2.Init.OwnAddress1 = 0;
+ hi2c2.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+ hi2c2.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+ hi2c2.Init.OwnAddress2 = 0;
+ hi2c2.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+ hi2c2.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+ if (HAL_I2C_Init(&hi2c2) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief USART3 Initialization Function
-  * @param None
-  * @retval None
-  */
-static void MX_USART3_UART_Init(void) {
-  huart3.Instance = USART3;
-  huart3.Init.BaudRate = 115200;
-  huart3.Init.WordLength = UART_WORDLENGTH_8B;
-  huart3.Init.StopBits = UART_STOPBITS_1;
-  huart3.Init.Parity = UART_PARITY_NONE;
-  huart3.Init.Mode = UART_MODE_TX_RX;
-  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
-  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+static void MX_USART3_UART_Init(void) { huart3.Instance = USART3; huart3.Init.BaudRate = 115200; huart3.Init.WordLength = UART_WORDLENGTH_8B; huart3.Init.StopBits = UART_STOPBITS_1; huart3.Init.Parity = UART_PARITY_NONE; huart3.Init.Mode = UART_MODE_TX_RX; huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE; huart3.Init.OverSampling = UART_OVERSAMPLING_16; if (HAL_UART_Init(&huart3) != HAL_OK) { Error_Handler(); } HAL_NVIC_SetPriority(USART3_IRQn, 0, 0); HAL_NVIC_EnableIRQ(USART3_IRQn); }
 
-  if (HAL_UART_Init(&huart3) != HAL_OK) {
-    Error_Handler();
-  }
+static void MX_ADC1_Init(void) {
+ ADC_ChannelConfTypeDef sConfig = {0};
+ hadc1.Instance = ADC1;
+ hadc1.Init.ClockPrescaler = ADC_CLOCKPRESCALER_PCLK_DIV4;
+ hadc1.Init.Resolution = ADC_RESOLUTION12b;
+ hadc1.Init.ScanConvMode = DISABLE;
+ hadc1.Init.ContinuousConvMode = DISABLE;
+ hadc1.Init.DiscontinuousConvMode = DISABLE;
+ hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIG_EDGE_NONE;
+ hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+ hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+ hadc1.Init.NbrOfConversion = 1;
+ hadc1.Init.DMAContinuousRequests = DISABLE;
+ hadc1.Init.EOCSelection = EOC_SINGLE_CONV;
+ if (HAL_ADC_Init(&hadc1) != HAL_OK) Error_Handler();
+
+ sConfig.Channel = ADC_CHANNEL_0;
+ sConfig.Rank = 1;
+ sConfig.SamplingTime = ADC_SAMPLETIME_84CYCLES;
+ if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief USB_OTG_FS Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_USB_OTG_FS_PCD_Init(void) {
-  hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
-  hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
-  hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
-  hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
-  hpcd_USB_OTG_FS.Init.Sof_enable = ENABLE;
-  hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
-  hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
-  hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
-
-  if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK) {
-    Error_Handler();
-  }
+ hpcd_USB_OTG_FS.Instance = USB_OTG_FS;
+ hpcd_USB_OTG_FS.Init.dev_endpoints = 6;
+ hpcd_USB_OTG_FS.Init.speed = PCD_SPEED_FULL;
+ hpcd_USB_OTG_FS.Init.dma_enable = DISABLE;
+ hpcd_USB_OTG_FS.Init.phy_itface = PCD_PHY_EMBEDDED;
+ hpcd_USB_OTG_FS.Init.Sof_enable = ENABLE;
+ hpcd_USB_OTG_FS.Init.low_power_enable = DISABLE;
+ hpcd_USB_OTG_FS.Init.lpm_enable = DISABLE;
+ hpcd_USB_OTG_FS.Init.vbus_sensing_enable = ENABLE;
+ hpcd_USB_OTG_FS.Init.use_dedicated_ep1 = DISABLE;
+ if (HAL_PCD_Init(&hpcd_USB_OTG_FS) != HAL_OK) Error_Handler();
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_GPIO_Init(void) {
-  GPIO_InitTypeDef GPIO_InitStruct = {0};
+ GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-  __HAL_RCC_GPIOC_CLK_ENABLE();
-  __HAL_RCC_GPIOF_CLK_ENABLE();
-  __HAL_RCC_GPIOH_CLK_ENABLE();
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  __HAL_RCC_GPIOD_CLK_ENABLE();
-  __HAL_RCC_GPIOG_CLK_ENABLE();
-  __HAL_RCC_GPIOA_CLK_ENABLE();
+ __HAL_RCC_GPIOC_CLK_ENABLE();
+ __HAL_RCC_GPIOF_CLK_ENABLE();
+ __HAL_RCC_GPIOH_CLK_ENABLE();
+ __HAL_RCC_GPIOB_CLK_ENABLE();
+ __HAL_RCC_GPIOD_CLK_ENABLE();
+ __HAL_RCC_GPIOG_CLK_ENABLE();
+ __HAL_RCC_GPIOA_CLK_ENABLE();
+ __HAL_RCC_GPIOE_CLK_ENABLE();
 
-  HAL_GPIO_WritePin(GPIOB, LD1_Pin | LD3_Pin | LD2_Pin, GPIO_PIN_RESET);
-  HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
+ HAL_GPIO_WritePin(GPIOB, LD1_Pin | LD3_Pin | LD2_Pin, GPIO_PIN_RESET);
+ HAL_GPIO_WritePin(USB_PowerSwitchOn_GPIO_Port, USB_PowerSwitchOn_Pin, GPIO_PIN_RESET);
 
-  GPIO_InitStruct.Pin = USER_Btn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
+ GPIO_InitStruct.Pin = USER_Btn_Pin;
+ GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+ GPIO_InitStruct.Pull = GPIO_NOPULL;
+ HAL_GPIO_Init(USER_Btn_GPIO_Port, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = LD1_Pin | LD3_Pin | LD2_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+ GPIO_InitStruct.Pin = LD1_Pin | LD3_Pin | LD2_Pin;
+ GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+ GPIO_InitStruct.Pull = GPIO_NOPULL;
+ GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+ HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
+ GPIO_InitStruct.Pin = USB_PowerSwitchOn_Pin;
+ GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+ GPIO_InitStruct.Pull = GPIO_NOPULL;
+ GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+ HAL_GPIO_Init(USB_PowerSwitchOn_GPIO_Port, &GPIO_InitStruct);
 
-  GPIO_InitStruct.Pin = USB_OverCurrent_Pin;
-  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+ GPIO_InitStruct.Pin = USB_OverCurrent_Pin;
+ GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+ GPIO_InitStruct.Pull = GPIO_NOPULL;
+ HAL_GPIO_Init(USB_OverCurrent_GPIO_Port, &GPIO_InitStruct);
+
+ GPIO_InitStruct.Pin = J1_SW_Pin | J2_SW_Pin;
+ GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+ GPIO_InitStruct.Pull = GPIO_PULLUP;
+ HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+
+ HAL_NVIC_SetPriority(EXTI15_10_IRQn, 2, 0);
+ HAL_NVIC_EnableIRQ(EXTI15_10_IRQn);
 }
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void) {
-  __disable_irq();
-  while (1) {
-  }
+ __disable_irq();
+ while (1) {}
 }
 
 #ifdef USE_FULL_ASSERT
-void assert_failed(uint8_t *file, uint32_t line) {
-}
+void assert_failed(uint8_t *file, uint32_t line) {}
 #endif /* USE_FULL_ASSERT */
-
-
-
-
-
-
-
-
